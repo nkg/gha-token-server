@@ -1,0 +1,23 @@
+# Go build artefacts
+/bin/
+/dist/
+*.test
+*.out
+coverage.out
+token-server
+github-app-token-server
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+.env
+.env.local
+*.pem

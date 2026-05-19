@@ -1,0 +1,39 @@
+glob_matcher: doublestar
+
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "**/*.go"
+      run: |
+        unformatted=$(gofmt -l {staged_files})
+        if [ -n "$unformatted" ]; then
+          echo "gofmt would reformat:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    go-vet:
+      glob: "**/*.go"
+      run: go vet ./...
+
+pre-push:
+  commands:
+    no-push-to-main:
+      run: |
+        branch=$(git rev-parse --abbrev-ref HEAD)
+        if [ "$branch" = "main" ]; then
+          echo "Direct push to main is not allowed. Use a branch and PR."
+          exit 1
+        fi
+        if [ -s "$LEFTHOOK_STDIN" ]; then
+          while read -r local_ref local_sha remote_ref remote_sha; do
+            if echo "$remote_ref" | grep -qE '^refs/heads/main$'; then
+              echo "Direct push to main is not allowed. Use a branch and PR."
+              exit 1
+            fi
+          done < "$LEFTHOOK_STDIN"
+        fi
+
+    go-test:
+      run: go test ./...

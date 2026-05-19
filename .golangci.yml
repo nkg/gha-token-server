@@ -1,0 +1,32 @@
+# golangci-lint config.
+#
+# Strict by default, with targeted exclusions for the
+# fire-and-forget I/O patterns that errcheck flags but the Go idiom
+# generally accepts:
+#
+#   - `(net/http.ResponseWriter).Write` — by the time the handler is
+#     writing, headers are already sent; an error here just means the
+#     client disconnected mid-response. Nothing useful to do.
+#   - `fmt.Fprint` / `(*json.Encoder).Encode` to a ResponseWriter —
+#     same reasoning.
+#   - `(io.Closer).Close` on read-only response bodies — closing a
+#     read body that we've already consumed can't fail in any way
+#     we'd recover from.
+#
+# Real I/O paths (file writes, outgoing HTTP requests, etc.) still
+# get checked.
+
+version: "2"
+
+linters:
+  default: standard
+
+  settings:
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*encoding/json.Encoder).Encode
+        - (io.Closer).Close

@@ -1,0 +1,6 @@
+[tools]
+go = "1.26"
+# golangci-lint v2.x supports Go 1.26+; v1.x is built with Go 1.24 and
+# refuses to lint code that declares a higher `go` directive.
+golangci-lint = "2"
+lefthook = "1"
