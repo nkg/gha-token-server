@@ -35,7 +35,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test -race -coverprofile=coverage.out ./...
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -53,7 +53,7 @@ jobs:
       - run: |
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o dist/gha-token-server .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gha-token-server-${{ github.sha }}
           path: dist/gha-token-server
