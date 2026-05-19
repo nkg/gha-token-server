@@ -71,7 +71,7 @@ jobs:
       # v8 installs golangci-lint v2.x, which is the line built with
       # Go 1.26+. v6 only knows about v1.x and refuses to lint code
       # that declares a `go` directive higher than its own build.
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
 
