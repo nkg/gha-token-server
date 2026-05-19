@@ -9,7 +9,7 @@ COPY main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o token-server .
 
 # ─── Runtime ──────────────────────────────────────────────────
-FROM alpine:3.22
+FROM alpine:3.23
 
 LABEL org.opencontainers.image.title="gha-token-server"
 LABEL org.opencontainers.image.description="GitHub App backed token server for self-hosted Actions runners"
