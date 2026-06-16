@@ -1,0 +1,15 @@
+name: Lint workflows
+
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+
+jobs:
+  lint:
+    uses: nkg/github-actions/.github/workflows/lint-workflows.yml@v2
