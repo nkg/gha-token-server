@@ -14,32 +14,15 @@ permissions:
   contents: read
 
 jobs:
-  vet:
-    name: go vet
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go vet ./...
-
-  test:
-    name: go test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go test -race -coverprofile=coverage.out ./...
-      - uses: actions/upload-artifact@v7
-        with:
-          name: coverage
-          path: coverage.out
-          retention-days: 14
+  # gofmt + vet + race tests (coverage) + golangci-lint + non-blocking
+  # govulncheck, via the shared reusable. go + golangci-lint come from
+  # mise.toml. Replaces the previous vet/test/lint jobs.
+  go:
+    uses: nkg/github-actions/.github/workflows/go.yml@v2
+    with:
+      use-mise: true
+      run-golangci-lint: true
+      govulncheck-soft: true
 
   build:
     name: go build
@@ -58,22 +41,6 @@ jobs:
           name: gha-token-server-${{ github.sha }}
           path: dist/gha-token-server
           retention-days: 14
-
-  lint:
-    name: golangci-lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      # v8 installs golangci-lint v2.x, which is the line built with
-      # Go 1.26+. v6 only knows about v1.x and refuses to lint code
-      # that declares a `go` directive higher than its own build.
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: latest
 
   docker-build:
     name: docker build
