@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -736,7 +738,7 @@ func TestGetInstallationToken(t *testing.T) {
 		defer server.Close()
 
 		cfg := testConfig(t, server.URL)
-		token, err := getInstallationToken(cfg, cfg.Tenants["test-org"])
+		token, err := getInstallationToken(t.Context(), cfg, cfg.Tenants["test-org"])
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -763,13 +765,13 @@ func TestGetInstallationToken(t *testing.T) {
 		tenant := cfg.Tenants["test-org"]
 
 		// First call → cache miss
-		token1, err := getInstallationToken(cfg, tenant)
+		token1, err := getInstallationToken(t.Context(), cfg, tenant)
 		if err != nil {
 			t.Fatalf("first call: %v", err)
 		}
 
 		// Second call → cache hit
-		token2, err := getInstallationToken(cfg, tenant)
+		token2, err := getInstallationToken(t.Context(), cfg, tenant)
 		if err != nil {
 			t.Fatalf("second call: %v", err)
 		}
@@ -791,7 +793,7 @@ func TestGetInstallationToken(t *testing.T) {
 		defer server.Close()
 
 		cfg := testConfig(t, server.URL)
-		_, err := getInstallationToken(cfg, cfg.Tenants["test-org"])
+		_, err := getInstallationToken(t.Context(), cfg, cfg.Tenants["test-org"])
 		if err == nil {
 			t.Fatal("expected error for 401")
 		}
@@ -820,7 +822,7 @@ func TestGetInstallationToken(t *testing.T) {
 		defer server.Close()
 
 		cfg := testConfig(t, server.URL)
-		token, err := getInstallationToken(cfg, cfg.Tenants["test-org"])
+		token, err := getInstallationToken(t.Context(), cfg, cfg.Tenants["test-org"])
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -857,7 +859,7 @@ func TestGetRegistrationToken(t *testing.T) {
 		cfg := testConfig(t, server.URL)
 		cfg.GitHubRepo = "" // org-level
 
-		token, err := getRunnerToken(cfg, "install-token", "test-org", "registration")
+		token, err := getRunnerToken(t.Context(), cfg, "install-token", "test-org", "registration")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -884,7 +886,7 @@ func TestGetRegistrationToken(t *testing.T) {
 		cfg := testConfig(t, server.URL)
 		cfg.GitHubRepo = "my-repo"
 
-		token, err := getRunnerToken(cfg, "install-token", "test-org", "registration")
+		token, err := getRunnerToken(t.Context(), cfg, "install-token", "test-org", "registration")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -901,7 +903,7 @@ func TestGetRegistrationToken(t *testing.T) {
 		defer server.Close()
 
 		cfg := testConfig(t, server.URL)
-		_, err := getRunnerToken(cfg, "install-token", "test-org", "registration")
+		_, err := getRunnerToken(t.Context(), cfg, "install-token", "test-org", "registration")
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -1435,6 +1437,55 @@ func TestDurationHistogramCumulativeBuckets(t *testing.T) {
 
 // ── TestCacheThunderingHerd ─────────────────────────────────────────
 
+// ── TestContextCancellation ─────────────────────────────────────────
+
+// Outgoing GitHub calls must observe the caller's context. Before
+// these used NewRequestWithContext, a client that hung up left the
+// request running until the http.Client's own 30s timeout — so a
+// caller disconnecting bought nothing, and the retry sleep blocked
+// for a full second regardless.
+func TestGitHubCallHonoursContextCancellation(t *testing.T) {
+	resetCache()
+	metrics = newServerMetrics()
+	defer func() { metrics = nil }()
+
+	// Stub that never answers, so the only way out is cancellation.
+	blocked := make(chan struct{})
+	defer close(blocked)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+
+	cfg := testConfig(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := getInstallationToken(ctx, cfg, cfg.Tenants["test-org"])
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("getInstallationToken() error = nil, want a cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+	// The shared client's timeout is 30s and the retry sleep is 1s.
+	// Returning well inside both is what proves cancellation reached
+	// the request rather than the call simply timing out.
+	if elapsed > 5*time.Second {
+		t.Errorf("took %v to observe cancellation; context is not reaching the request", elapsed)
+	}
+}
+
 func TestCacheThunderingHerd(t *testing.T) {
 	resetCache()
 	metrics = newServerMetrics()
@@ -1471,7 +1522,7 @@ func TestCacheThunderingHerd(t *testing.T) {
 	for i := 0; i < numCallers; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			tokens[idx], errs[idx] = getInstallationToken(cfg, tenant)
+			tokens[idx], errs[idx] = getInstallationToken(t.Context(), cfg, tenant)
 		}(i)
 	}
 
