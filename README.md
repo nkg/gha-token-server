@@ -237,6 +237,35 @@ than the only control. There's still no mTLS — the credential is a
 shared secret in transit, so keep this on a private network or put TLS
 in front of it.
 
+## Verifying a release
+
+Released images are signed with [cosign](https://docs.sigstore.dev/)
+keyless OIDC, and carry an SPDX SBOM plus SLSA build provenance as
+in-toto attestations. There is no long-lived signing key — the
+signature is bound to the GitHub Actions workflow that produced the
+image.
+
+```bash
+IMAGE=ghcr.io/nkg/gha-token-server:<tag>
+
+# Signature. The identity regexp is what makes this meaningful:
+# it asserts the image was built by *this* repo's workflow, not
+# merely that someone signed it.
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp '^https://github.com/nkg/gha-token-server/' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+
+# Build provenance (what built it, from which commit)
+gh attestation verify "oci://$IMAGE" --repo nkg/gha-token-server
+
+# SBOM
+cosign download sbom "$IMAGE"
+```
+
+Signatures bind the **digest**, not the tag — a tag can be moved, a
+digest cannot. Pin by digest in production if you want the guarantee
+to hold over time.
+
 ## Design notes
 
 ### Why bearer tokens rather than mTLS
