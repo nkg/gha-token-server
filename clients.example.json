@@ -1,0 +1,12 @@
+[
+  {
+    "name": "ansible-provisioner",
+    "token_sha256": "REPLACE_WITH_SHA256_OF_ANSIBLE_TOKEN",
+    "orgs": ["myorg"]
+  },
+  {
+    "name": "nkg-autoscaler",
+    "token_sha256": "REPLACE_WITH_SHA256_OF_AUTOSCALER_TOKEN",
+    "orgs": ["*"]
+  }
+]

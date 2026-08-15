@@ -18,15 +18,122 @@ mode is kept for compatibility.
 
 ## Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/token?org=<org>` | Mint a runner **registration** token for `<org>`. Returns the bare token as `text/plain`. |
-| `GET` | `/remove-token?org=<org>` | Mint a runner **removal** token for `<org>`. Same response shape as `/token`. |
-| `GET` | `/health` | Liveness probe. Returns `{"status":"healthy"}`. |
-| `GET` | `/metrics` | Prometheus exposition (counters + histograms for HTTP / cache / GitHub API). |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/token?org=<org>` | **required** | Mint a runner **registration** token for `<org>`. Returns the bare token as `text/plain`. |
+| `GET` | `/remove-token?org=<org>` | **required** | Mint a runner **removal** token for `<org>`. Same response shape as `/token`. |
+| `GET` | `/health` | open | Liveness probe. Returns `{"status":"healthy"}`. |
+| `GET` | `/metrics` | open | Prometheus exposition (counters + histograms for HTTP / cache / GitHub API / auth failures). |
 
 If `GITHUB_ORG` is set (or there's only one configured tenant), the
 `?org=` parameter can be omitted and the default tenant is used.
+
+`/health` and `/metrics` are deliberately unauthenticated — probes and
+Prometheus need them, and neither exposes org names or token material.
+
+## Authentication
+
+Minting a runner registration token is equivalent to being able to
+attach a runner to the org, and therefore to collect whatever jobs and
+secrets that org hands out. Callers must present a bearer token:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://token-server.lab:8080/token?org=myorg"
+```
+
+### Configuring clients
+
+Each client is a named credential with an explicit list of orgs it may
+mint for. Only the **SHA-256 of the token** is configured, so the
+deployed config never carries a credential that would work if read.
+
+```bash
+# Generate a token and its hash. Keep the token; configure the hash.
+TOKEN=$(openssl rand -hex 32)
+echo "token: $TOKEN"
+echo "hash:  $(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)"
+```
+
+> Use `printf '%s'`, not `echo` — a trailing newline changes the
+> digest and you'll get a 401 that looks inexplicable.
+
+```json
+[
+  { "name": "ansible-provisioner", "token_sha256": "<64 hex chars>", "orgs": ["myorg"] },
+  { "name": "nkg-autoscaler",      "token_sha256": "<64 hex chars>", "orgs": ["*"]     }
+]
+```
+
+See `clients.example.json`. Its placeholders are deliberately not
+valid digests, so starting with it unedited fails immediately with a
+message naming the offending field rather than silently accepting a
+credential nobody holds.
+
+| Field | Description |
+|---|---|
+| `name` | Identifies the caller in logs and audit lines. Not a secret. |
+| `token_sha256` | 64 hex characters. The SHA-256 of the bearer token. |
+| `orgs` | Orgs this client may mint for. `["*"]` authorises every tenant. |
+
+Point the server at it:
+
+```bash
+TOKEN_SERVER_CLIENTS_PATH=/etc/token-server/clients.json   # preferred
+TOKEN_SERVER_CLIENTS='[{"name":"…","token_sha256":"…","orgs":["…"]}]'  # inline alternative
+```
+
+The path wins if both are set. The file form suits the SOPS-rendered
+deployment; the inline form suits a container that would rather pass
+one env var than mount a file.
+
+Config is validated at startup and the server refuses to start on:
+a `token_sha256` that isn't a SHA-256 digest (which catches pasting
+the plaintext token in by mistake), two clients sharing a token,
+duplicate names, an empty `orgs`, or an ACL naming an org that isn't
+a configured tenant — a typo there would otherwise show up only as
+403s against a name that looks correct.
+
+### Responses
+
+| Status | Meaning |
+|---|---|
+| `401` | No credential, a malformed `Authorization` header, or an unrecognised token. Carries a `WWW-Authenticate: Bearer` challenge. |
+| `403` | Valid credential, but not authorised for the requested org. |
+
+`403` is returned both when the client isn't authorised for an org and
+when that org isn't configured here at all, with an identical body.
+Distinguishing them would let any caller holding one valid credential
+enumerate which orgs this server serves.
+
+### Running without authentication
+
+```bash
+TOKEN_SERVER_ALLOW_ANONYMOUS=true
+```
+
+Restores the old behaviour: any caller that can reach the port can
+mint for any configured org. The server logs a `WARN` on every start
+in this mode.
+
+It exists so the binary can be rolled out before every caller has been
+issued a credential. **Without it, and with no clients configured, the
+server refuses to start** — an unauthenticated token minter is not a
+safe default, firewall or not.
+
+### Migrating an existing deployment
+
+This is a breaking change for a server that's already running.
+
+1. Deploy with `TOKEN_SERVER_ALLOW_ANONYMOUS=true`. Nothing changes for
+   existing callers.
+2. Mint a token per caller, configure the hashes, and update each
+   caller to send the `Authorization` header.
+3. Watch `token_server_auth_failures_total` — while anonymous mode is
+   on it stays at zero, so first confirm each caller works by pointing
+   a test instance without the flag at the same config.
+4. Drop `TOKEN_SERVER_ALLOW_ANONYMOUS` and restart. Any caller you
+   missed now gets a `401`, visible in both the metric and the logs.
 
 ## Configuration
 
@@ -68,6 +175,11 @@ GITHUB_APP_PRIVATE_KEY_PATH=<path to PEM>
 | `GITHUB_ORG` | no | (single-tenant) | Default org when `?org=` is omitted. Must match a configured tenant. |
 | `GITHUB_REPO` | no | — | Optional repo-scope; applies under whichever tenant is in play. |
 | `TOKEN_SERVER_ADDR` | no | `:8080` | HTTP listen address. |
+| `TOKEN_SERVER_CLIENTS_PATH` | yes\* | — | Path to the clients JSON. See [Authentication](#authentication). |
+| `TOKEN_SERVER_CLIENTS` | yes\* | — | Inline clients JSON. `TOKEN_SERVER_CLIENTS_PATH` wins if both are set. |
+| `TOKEN_SERVER_ALLOW_ANONYMOUS` | no | `false` | `true` disables caller authentication entirely. |
+
+\* One of the two is required unless `TOKEN_SERVER_ALLOW_ANONYMOUS=true`.
 
 ## Run
 
@@ -76,6 +188,14 @@ GITHUB_APP_PRIVATE_KEY_PATH=<path to PEM>
 ```bash
 mise install
 export GITHUB_APP_TENANTS="myorg:123456:7890123:./myorg.pem"
+export TOKEN_SERVER_CLIENTS_PATH=./clients.json
+go run .
+```
+
+For a throwaway local run without setting up credentials:
+
+```bash
+export TOKEN_SERVER_ALLOW_ANONYMOUS=true
 go run .
 ```
 
@@ -85,7 +205,9 @@ go run .
 docker run --rm \
   -p 8080:8080 \
   -e GITHUB_APP_TENANTS="myorg:123456:7890123:/secrets/myorg.pem" \
+  -e TOKEN_SERVER_CLIENTS_PATH=/secrets/clients.json \
   -v $(pwd)/myorg.pem:/secrets/myorg.pem:ro \
+  -v $(pwd)/clients.json:/secrets/clients.json:ro \
   ghcr.io/nkg/gha-token-server:v0.1.0
 ```
 
@@ -109,12 +231,56 @@ GitHub App credentials. It's also the only one of the two that mints
 
 Deployed on the private services tier (VLAN-isolated, in the
 [terraform-proxmox-fleet](https://github.com/nkg/terraform-proxmox-fleet)
-deployment). No mTLS and no application-level authn today — the
-firewall does the authentication work. See the roadmap; treat network
-reachability to this port as equivalent to holding the org's runner
-registration capability.
+deployment). Callers now authenticate with a bearer token and are
+scoped to specific orgs, so the firewall is defence in depth rather
+than the only control. There's still no mTLS — the credential is a
+shared secret in transit, so keep this on a private network or put TLS
+in front of it.
 
 ## Design notes
+
+### Why bearer tokens rather than mTLS
+
+The roadmap originally had mTLS. The consumers here are Ansible plays,
+shell scripts and small autoscalers, where adding a header is one line
+and issuing, distributing and rotating a client certificate per caller
+is a standing operational cost. Bearer tokens also carry the caller's
+*identity* naturally, which is what the per-org ACL needs — mTLS would
+have required mapping certificate subjects to orgs to get the same
+thing. mTLS remains on the roadmap as an alternative for deployments
+that would rather not hold a shared secret at each caller.
+
+### Only hashes are configured
+
+The clients file holds `token_sha256`, never the token. Reading the
+deployed config — or a backup of it, or a SOPS decryption during
+review — doesn't yield anything that authenticates. Startup rejects a
+`token_sha256` that isn't 64 hex characters, which is what catches
+the natural mistake of pasting the plaintext token into that field.
+
+### Constant-time comparison, no short-circuit
+
+Every configured client is compared with `subtle.ConstantTimeCompare`
+and the loop does **not** break on the first match. Breaking early
+would make the response time depend on how far down the list a token
+sits, and for a non-matching token, on how many clients are
+configured.
+
+### Failure responses don't leak topology
+
+`401` covers "no credential", "malformed header" and "unknown token"
+with one body; `403` covers both "not authorised for this org" and
+"no such org here". The `reason` is recorded in the metric and the
+log, where the operator can see it, but never in the response — a
+caller shouldn't be able to use the difference to enumerate valid
+tokens or discover which orgs this server serves.
+
+### Auth failures are a metric, not just a log line
+
+`token_server_auth_failures_total{reason}` is worth alerting on: a
+rising `unknown_token` is someone probing the port, and a rising
+`missing_header` after a rollout is usually a caller that was missed
+in the migration.
 
 ### Cached installation tokens
 
@@ -161,20 +327,31 @@ wrappers around the App installation flow.
 ## Tests
 
 ```bash
-go test ./...                 # 14 tests, ~2s
+go test ./...                 # ~2s
 go test -race ./...           # race detector
 go test -cover ./...          # coverage
 ```
 
 Coverage spans config parsing (both formats), JWT generation,
 GitHub API mock interaction, multi-tenant routing, per-tenant key
-isolation, cache thundering-herd, and the handlers.
+isolation, cache thundering-herd, the metrics histogram, and the
+handlers.
+
+Auth coverage is in `auth_test.go`: client-config parsing and its
+rejections, the fail-closed startup rule, bearer parsing (including
+that presenting the stored *hash* does not authenticate), org-ACL
+enforcement, and that an unauthorised org is indistinguishable from
+an unconfigured one. The behaviour tests present a real credential
+rather than enabling anonymous mode, so they exercise the
+authenticated path that runs in production.
 
 ## Roadmap
 
 - **v0.2** — `/runner-registration-token` JSON endpoint (alongside the existing text/plain `/token`) so the dispatcher can read `expires_at` and decide whether to mint a fresh one
-- **v0.3** — mTLS option for client auth (drop the "firewall does authn" assumption)
-- **v0.4** — Token-server own ACL (deny mints from un-authorised callers, not just the network layer)
+- ~~**v0.3** — mTLS option for client auth (drop the "firewall does authn" assumption)~~ — **partly done**: bearer-token authn landed, so the "firewall does authn" assumption is gone. mTLS itself is still open; see below.
+- ~~**v0.4** — Token-server own ACL (deny mints from un-authorised callers, not just the network layer)~~ — **done**: per-client org ACLs, enforced before the tenant lookup.
+- **mTLS** — client certificates as an alternative to bearer tokens, for deployments that would rather not hold a shared secret at each caller. Bearer tokens were chosen first because the consumers here are Ansible and shell scripts, where a header is trivial and cert distribution and rotation is not.
+- **Token rotation** — support two valid hashes per client so a credential can be rolled without a flag-day restart.
 
 ## License
 
