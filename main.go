@@ -630,14 +630,24 @@ func generateJWT(tenant *Tenant) (string, error) {
 }
 
 // doRequestWithRetry executes an HTTP request with a single retry on network errors or 5xx.
-func doRequestWithRetry(method, url string, headers map[string]string) (*http.Response, []byte, error) {
+//
+// The context is threaded through to the outgoing request so a client
+// that disconnects — or a request that trips the server's write
+// timeout — cancels the in-flight GitHub call instead of leaving it to
+// run to its own 30s timeout. It also makes the retry sleep
+// cancellable, which previously blocked for a full second regardless.
+func doRequestWithRetry(ctx context.Context, method, url string, headers map[string]string) (*http.Response, []byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
 		}
 
-		req, err := http.NewRequest(method, url, nil)
+		req, err := http.NewRequestWithContext(ctx, method, url, nil)
 		if err != nil {
 			return nil, nil, fmt.Errorf("creating request: %w", err)
 		}
@@ -679,7 +689,7 @@ func doRequestWithRetry(method, url string, headers map[string]string) (*http.Re
 // name, so concurrent callers for the same tenant share one upstream fetch
 // (the original thundering-herd guard) while concurrent callers for
 // different tenants refresh in parallel.
-func getInstallationToken(cfg *Config, tenant *Tenant) (string, error) {
+func getInstallationToken(ctx context.Context, cfg *Config, tenant *Tenant) (string, error) {
 	// Fast path: cache hit doesn't need to wait on any in-flight refresh.
 	cache.mu.Lock()
 	entry, ok := cache.entries[tenant.Org]
@@ -717,7 +727,7 @@ func getInstallationToken(cfg *Config, tenant *Tenant) (string, error) {
 			"User-Agent":    "github-app-token-server",
 		}
 
-		resp, body, err := doRequestWithRetry("POST", url, headers)
+		resp, body, err := doRequestWithRetry(ctx, "POST", url, headers)
 		if err != nil {
 			if metrics != nil {
 				metrics.recordGitHubAPIError("get_installation_token")
@@ -763,7 +773,7 @@ func getInstallationToken(cfg *Config, tenant *Tenant) (string, error) {
 // removal token. kind is "registration" or "remove" — it controls both the
 // GitHub API URL suffix and the metric label. org is the org the token is
 // being minted for; the caller has already resolved org → tenant.
-func getRunnerToken(cfg *Config, installToken, org, kind string) (string, error) {
+func getRunnerToken(ctx context.Context, cfg *Config, installToken, org, kind string) (string, error) {
 	var url string
 	if cfg.GitHubRepo != "" {
 		url = fmt.Sprintf("%s/repos/%s/%s/actions/runners/%s-token",
@@ -781,7 +791,7 @@ func getRunnerToken(cfg *Config, installToken, org, kind string) (string, error)
 
 	metricOp := "get_" + kind + "_token"
 
-	resp, body, err := doRequestWithRetry("POST", url, headers)
+	resp, body, err := doRequestWithRetry(ctx, "POST", url, headers)
 	if err != nil {
 		if metrics != nil {
 			metrics.recordGitHubAPIError(metricOp)
@@ -864,14 +874,14 @@ func runnerTokenHandler(cfg *Config, kind string) http.HandlerFunc {
 			return
 		}
 
-		installToken, err := getInstallationToken(cfg, tenant)
+		installToken, err := getInstallationToken(r.Context(), cfg, tenant)
 		if err != nil {
 			slog.Error("failed to get installation token", "org", org, "error", err)
 			http.Error(w, "Failed to get installation token", http.StatusInternalServerError)
 			return
 		}
 
-		token, err := getRunnerToken(cfg, installToken, org, kind)
+		token, err := getRunnerToken(r.Context(), cfg, installToken, org, kind)
 		if err != nil {
 			// If the call failed due to auth error, the cached installation token
 			// may have been revoked externally. Invalidate cache and retry once.
@@ -880,14 +890,14 @@ func runnerTokenHandler(cfg *Config, kind string) http.HandlerFunc {
 					"org", org, "kind", kind, "error", err)
 				invalidateTokenCache(org)
 
-				installToken, err = getInstallationToken(cfg, tenant)
+				installToken, err = getInstallationToken(r.Context(), cfg, tenant)
 				if err != nil {
 					slog.Error("failed to get installation token on retry", "org", org, "error", err)
 					http.Error(w, "Failed to get installation token", http.StatusInternalServerError)
 					return
 				}
 
-				token, err = getRunnerToken(cfg, installToken, org, kind)
+				token, err = getRunnerToken(r.Context(), cfg, installToken, org, kind)
 				if err != nil {
 					slog.Error("failed to get runner token on retry", "org", org, "kind", kind, "error", err)
 					http.Error(w, "Failed to get runner token", http.StatusInternalServerError)
