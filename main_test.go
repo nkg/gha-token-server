@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -83,6 +84,31 @@ func writeTempKeyFile(t *testing.T, key *rsa.PrivateKey) string {
 	return path
 }
 
+// testClientToken is the bearer token the behaviour tests present.
+const testClientToken = "test-client-token"
+
+// testClients returns a single wildcard-authorised client holding
+// testClientToken.
+//
+// Behaviour tests use this rather than AllowAnonymous so they run
+// through the real authenticated path — which is the default in
+// production, and the one worth regression-testing.
+func testClients() []*Client {
+	c := &Client{
+		Name:     "test-client",
+		wildcard: true,
+		orgs:     map[string]struct{}{},
+	}
+	c.tokenHash = sha256.Sum256([]byte(testClientToken))
+	return []*Client{c}
+}
+
+// authed attaches a valid bearer header for testClientToken.
+func authed(req *http.Request) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+testClientToken)
+	return req
+}
+
 // testConfig returns a Config with one tenant ("test-org" → app 12345, install
 // 67890), matching the legacy single-tenant test setup. The shared test key
 // is reused — distinct-key tests build their own Config.
@@ -101,6 +127,7 @@ func testConfig(t *testing.T, baseURL string) *Config {
 		DefaultOrg:    "test-org",
 		ListenAddr:    ":0",
 		githubBaseURL: baseURL,
+		Clients:       testClients(),
 	}
 }
 
@@ -138,9 +165,16 @@ func clearTokenEnv(t *testing.T) {
 		"GITHUB_ORG",
 		"GITHUB_REPO",
 		"TOKEN_SERVER_ADDR",
+		"TOKEN_SERVER_CLIENTS",
+		"TOKEN_SERVER_CLIENTS_PATH",
 	} {
 		t.Setenv(k, "")
 	}
+
+	// These tests exercise tenant and key parsing, not caller auth, so
+	// they opt out of the fail-closed clients requirement. The
+	// fail-closed behaviour itself is covered by TestLoadConfigClients.
+	t.Setenv("TOKEN_SERVER_ALLOW_ANONYMOUS", "true")
 }
 
 // ── TestLoadConfig (legacy single-App path) ─────────────────────────
@@ -914,7 +948,7 @@ func TestTokenHandler(t *testing.T) {
 		cfg := testConfig(t, server.URL)
 		handler := runnerTokenHandler(cfg, "registration")
 
-		req := httptest.NewRequest(http.MethodGet, "/token", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 
@@ -930,7 +964,7 @@ func TestTokenHandler(t *testing.T) {
 		cfg := testConfig(t, "http://unused")
 		handler := runnerTokenHandler(cfg, "registration")
 
-		req := httptest.NewRequest(http.MethodPost, "/token", nil)
+		req := authed(httptest.NewRequest(http.MethodPost, "/token", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 
@@ -950,7 +984,7 @@ func TestTokenHandler(t *testing.T) {
 		cfg := testConfig(t, server.URL)
 		handler := runnerTokenHandler(cfg, "registration")
 
-		req := httptest.NewRequest(http.MethodGet, "/token", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 
@@ -989,7 +1023,7 @@ func TestTokenHandler(t *testing.T) {
 		cfg := testConfig(t, server.URL)
 		handler := runnerTokenHandler(cfg, "remove")
 
-		req := httptest.NewRequest(http.MethodGet, "/remove-token", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/remove-token", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 
@@ -1071,13 +1105,14 @@ func TestMultiTenantRouting(t *testing.T) {
 		// DefaultOrg deliberately empty — caller must specify ?org=
 		ListenAddr:    ":0",
 		githubBaseURL: server.URL,
+		Clients:       testClients(),
 	}
 	handler := runnerTokenHandler(cfg, "registration")
 
 	t.Run("routes to correct installation, AppID, and org per tenant", func(t *testing.T) {
 		for org, tenant := range tenants {
 			resetCache()
-			req := httptest.NewRequest(http.MethodGet, "/token?org="+org, nil)
+			req := authed(httptest.NewRequest(http.MethodGet, "/token?org="+org, nil))
 			rec := httptest.NewRecorder()
 			handler(rec, req)
 
@@ -1098,7 +1133,7 @@ func TestMultiTenantRouting(t *testing.T) {
 	})
 
 	t.Run("400 when no org provided and no default", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/token", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -1107,7 +1142,7 @@ func TestMultiTenantRouting(t *testing.T) {
 	})
 
 	t.Run("404 for unknown tenant", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/token?org=nonexistent", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token?org=nonexistent", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		if rec.Code != http.StatusNotFound {
@@ -1117,7 +1152,7 @@ func TestMultiTenantRouting(t *testing.T) {
 
 	t.Run("org param is case-insensitive", func(t *testing.T) {
 		resetCache()
-		req := httptest.NewRequest(http.MethodGet, "/token?org=ORGONE", nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token?org=ORGONE", nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		if rec.Code != http.StatusOK {
@@ -1180,12 +1215,13 @@ func TestPerTenantKeyIsolation(t *testing.T) {
 		Tenants:       tenants,
 		ListenAddr:    ":0",
 		githubBaseURL: server.URL,
+		Clients:       testClients(),
 	}
 	handler := runnerTokenHandler(cfg, "registration")
 
 	for org, tenant := range tenants {
 		resetCache()
-		req := httptest.NewRequest(http.MethodGet, "/token?org="+org, nil)
+		req := authed(httptest.NewRequest(http.MethodGet, "/token?org="+org, nil))
 		rec := httptest.NewRecorder()
 		handler(rec, req)
 		if rec.Code != http.StatusOK {
