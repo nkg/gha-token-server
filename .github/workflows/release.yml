@@ -89,7 +89,7 @@ jobs:
       # digest cannot. Every tag is signed at the same digest so
       # verifying by either tag or digest works.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign the image with cosign (keyless)
         env:
@@ -104,7 +104,7 @@ jobs:
           done <<< "$TAGS"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
