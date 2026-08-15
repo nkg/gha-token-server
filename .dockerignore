@@ -1,0 +1,12 @@
+.git
+.github
+*.md
+LICENSE
+.gitignore
+.dockerignore
+.golangci.yml
+mise.toml
+lefthook.yml
+*_test.go
+dist/
+bin/
