@@ -5,12 +5,11 @@ Actions runners. Multi-tenant (one or more orgs per server), cached
 installation tokens with thundering-herd protection, Prometheus
 metrics, JSON structured logs.
 
-Designed to sit alongside
+A standalone service for any client that needs short-lived runner
+tokens — Ansible, CI plumbing, custom autoscalers. Note that
 [nkg/gha-nomad-dispatcher](https://github.com/nkg/gha-nomad-dispatcher)
-— the dispatcher calls this service to mint registration tokens for
-each ephemeral runner it spawns. Can also be consumed directly by
-any client that needs short-lived runner tokens (Ansible, CI
-plumbing, custom autoscalers).
+folded this logic in as of its v0.2 and no longer calls this service;
+see "Relationship to gha-nomad-dispatcher" below.
 
 Lifted from a working internal deployment that's been running in
 production. Multi-tenancy is the recommended mode (per-org GitHub
@@ -93,22 +92,27 @@ docker run --rm \
 After a tag is pushed, the release workflow publishes multi-arch
 images (`linux/amd64` + `linux/arm64`).
 
-## Wiring into gha-nomad-dispatcher
+## Relationship to gha-nomad-dispatcher
 
-Set the dispatcher's `TOKEN_SERVER_URL` to point at this service.
-The dispatcher calls `GET /token?org=<org>` to mint the registration
-token it injects into each spawned runner container.
+**The dispatcher no longer calls this service.** As of its v0.2 it
+mints tokens in-process (`internal/github`), which drops one LXC and
+one secrets-distribution hop, and keeps the App private keys in a
+single place. Don't expect a `TOKEN_SERVER_URL` knob over there —
+it's gone.
 
-```
-# gha-nomad-dispatcher env:
-TOKEN_SERVER_URL=http://gha-token-server.lab:8080
-```
+This server remains useful for consumers that aren't the dispatcher:
+Ansible plays, ad-hoc `curl` from a provisioning script, custom
+autoscalers, or anything that wants a runner token without embedding
+GitHub App credentials. It's also the only one of the two that mints
+**removal** tokens, which `oci-actions-runner` needs for
+`RUNNER_REMOVE_TOKEN` when running non-ephemeral runners.
 
-The two services are designed to sit on the same private network
-(VLAN-isolated services tier in the
+Deployed on the private services tier (VLAN-isolated, in the
 [terraform-proxmox-fleet](https://github.com/nkg/terraform-proxmox-fleet)
-deployment). No mTLS today — the firewall does the authentication
-work.
+deployment). No mTLS and no application-level authn today — the
+firewall does the authentication work. See the roadmap; treat network
+reachability to this port as equivalent to holding the org's runner
+registration capability.
 
 ## Design notes
 
