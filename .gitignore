@@ -6,6 +6,8 @@
 coverage.out
 token-server
 github-app-token-server
+# `go build ./...` names the binary after the module directory
+gha-token-server
 
 # Editor / IDE
 .vscode/

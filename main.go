@@ -118,6 +118,55 @@ var httpClient = &http.Client{
 
 // ── Prometheus Metrics ──────────────────────────────────────────────
 
+// durationBuckets are the histogram upper bounds, in seconds. Shared
+// by the recording path and the exposition path so the two can't
+// drift apart.
+var durationBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+
+// durationHistogram is a fixed-memory histogram: one counter per
+// bucket plus a running sum and count.
+//
+// Memory is O(len(durationBuckets)) per endpoint no matter how many
+// requests the process serves. The earlier implementation retained
+// every individual observation in a slice that was never trimmed,
+// which grew without bound in a long-lived server and made each
+// /metrics scrape (which copied and sorted the whole slice) more
+// expensive than the last.
+type durationHistogram struct {
+	counts []int64 // counts[i] = observations landing in bucket i
+	sum    float64
+	count  int64
+}
+
+func newDurationHistogram() *durationHistogram {
+	return &durationHistogram{counts: make([]int64, len(durationBuckets))}
+}
+
+// observe records one duration. Observations above the final bound
+// are counted in sum/count but land in no bucket — Prometheus reads
+// them out of the +Inf bucket, which is emitted as the total count.
+func (h *durationHistogram) observe(v float64) {
+	h.sum += v
+	h.count++
+	for i, bound := range durationBuckets {
+		if v <= bound {
+			h.counts[i]++
+			return
+		}
+	}
+}
+
+// snapshot returns a deep copy, for rendering outside the lock.
+func (h *durationHistogram) snapshot() durationHistogram {
+	cp := durationHistogram{
+		counts: make([]int64, len(h.counts)),
+		sum:    h.sum,
+		count:  h.count,
+	}
+	copy(cp.counts, h.counts)
+	return cp
+}
+
 type serverMetrics struct {
 	mu sync.Mutex
 
@@ -125,8 +174,7 @@ type serverMetrics struct {
 	httpRequestsTotal map[string]map[int]int64
 
 	// Histogram: request duration by endpoint
-	httpDurationBuckets []float64
-	httpDurationObs     map[string][]float64 // endpoint -> observed durations
+	httpDuration map[string]*durationHistogram
 
 	// Counters
 	cacheHits       atomic.Int64
@@ -136,10 +184,9 @@ type serverMetrics struct {
 
 func newServerMetrics() *serverMetrics {
 	return &serverMetrics{
-		httpRequestsTotal:   make(map[string]map[int]int64),
-		httpDurationBuckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
-		httpDurationObs:     make(map[string][]float64),
-		githubAPIErrors:     make(map[string]int64),
+		httpRequestsTotal: make(map[string]map[int]int64),
+		httpDuration:      make(map[string]*durationHistogram),
+		githubAPIErrors:   make(map[string]int64),
 	}
 }
 
@@ -152,7 +199,12 @@ func (m *serverMetrics) recordRequest(endpoint string, statusCode int, duration 
 	}
 	m.httpRequestsTotal[endpoint][statusCode]++
 
-	m.httpDurationObs[endpoint] = append(m.httpDurationObs[endpoint], duration.Seconds())
+	h := m.httpDuration[endpoint]
+	if h == nil {
+		h = newDurationHistogram()
+		m.httpDuration[endpoint] = h
+	}
+	h.observe(duration.Seconds())
 }
 
 func (m *serverMetrics) recordGitHubAPIError(operation string) {
@@ -832,11 +884,9 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		reqTotal[ep] = c
 	}
 
-	durationObs := make(map[string][]float64, len(metrics.httpDurationObs))
-	for ep, obs := range metrics.httpDurationObs {
-		cp := make([]float64, len(obs))
-		copy(cp, obs)
-		durationObs[ep] = cp
+	durations := make(map[string]durationHistogram, len(metrics.httpDuration))
+	for ep, h := range metrics.httpDuration {
+		durations[ep] = h.snapshot()
 	}
 
 	apiErrors := make(map[string]int64, len(metrics.githubAPIErrors))
@@ -860,26 +910,22 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// token_server_http_request_duration_seconds (histogram)
-	buckets := []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+	//
+	// Prometheus histogram buckets are cumulative, so the per-bucket
+	// counts are accumulated as they're emitted.
 	b.WriteString("\n# HELP token_server_http_request_duration_seconds HTTP request duration\n")
 	b.WriteString("# TYPE token_server_http_request_duration_seconds histogram\n")
-	for _, ep := range sortedKeys(durationObs) {
-		obs := durationObs[ep]
-		sort.Float64s(obs)
-		var sum float64
-		for _, v := range obs {
-			sum += v
-		}
-		count := len(obs)
-
-		for _, bound := range buckets {
-			n := sort.SearchFloat64s(obs, bound+1e-9) // count of obs <= bound
+	for _, ep := range sortedKeys(durations) {
+		h := durations[ep]
+		var cumulative int64
+		for i, bound := range durationBuckets {
+			cumulative += h.counts[i]
 			fmt.Fprintf(&b, "token_server_http_request_duration_seconds_bucket{endpoint=%q,le=\"%s\"} %d\n",
-				ep, formatFloat(bound), n)
+				ep, formatFloat(bound), cumulative)
 		}
-		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_bucket{endpoint=%q,le=\"+Inf\"} %d\n", ep, count)
-		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_sum{endpoint=%q} %s\n", ep, formatFloat(sum))
-		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_count{endpoint=%q} %d\n", ep, count)
+		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_bucket{endpoint=%q,le=\"+Inf\"} %d\n", ep, h.count)
+		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_sum{endpoint=%q} %s\n", ep, formatFloat(h.sum))
+		fmt.Fprintf(&b, "token_server_http_request_duration_seconds_count{endpoint=%q} %d\n", ep, h.count)
 	}
 
 	// token_server_cache_hits_total / misses

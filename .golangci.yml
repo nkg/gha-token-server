@@ -30,3 +30,10 @@ linters:
         - fmt.Fprintln
         - (*encoding/json.Encoder).Encode
         - (io.Closer).Close
+
+# Formatting is enforced separately from linters in golangci-lint v2.
+# Without this block `gofmt` drift is invisible to CI — which is how
+# an unformatted file survived in the tree.
+formatters:
+  enable:
+    - gofmt
