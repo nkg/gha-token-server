@@ -1343,6 +1343,60 @@ func TestMetricsHandler(t *testing.T) {
 	}
 }
 
+// ── TestDurationHistogram ───────────────────────────────────────────
+
+// The histogram must use fixed memory regardless of how many requests
+// are observed — it previously retained every observation in a slice
+// that was never trimmed, leaking in a long-lived server.
+func TestDurationHistogramFixedMemory(t *testing.T) {
+	m := newServerMetrics()
+
+	for i := 0; i < 10000; i++ {
+		m.recordRequest("/token", 200, 42*time.Millisecond)
+	}
+
+	h := m.httpDuration["/token"]
+	if h == nil {
+		t.Fatal("no histogram recorded for /token")
+	}
+	if got, want := len(h.counts), len(durationBuckets); got != want {
+		t.Errorf("histogram retained %d counters, want exactly %d (one per bucket)", got, want)
+	}
+	if h.count != 10000 {
+		t.Errorf("count = %d, want 10000", h.count)
+	}
+}
+
+// Bucket counts must be cumulative in the exposition, and observations
+// beyond the final bound must appear only in +Inf.
+func TestDurationHistogramCumulativeBuckets(t *testing.T) {
+	metrics = newServerMetrics()
+	defer func() { metrics = nil }()
+
+	// 50ms → first bucket (le=0.1); 3s → le=5; 60s → beyond the final
+	// 30s bound, so it lands in +Inf only.
+	metrics.recordRequest("/token", 200, 50*time.Millisecond)
+	metrics.recordRequest("/token", 200, 3*time.Second)
+	metrics.recordRequest("/token", 200, 60*time.Second)
+
+	rec := httptest.NewRecorder()
+	metricsHandler(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		`token_server_http_request_duration_seconds_bucket{endpoint="/token",le="0.1"} 1`,
+		`token_server_http_request_duration_seconds_bucket{endpoint="/token",le="2.5"} 1`,
+		`token_server_http_request_duration_seconds_bucket{endpoint="/token",le="5.0"} 2`,
+		`token_server_http_request_duration_seconds_bucket{endpoint="/token",le="30.0"} 2`,
+		`token_server_http_request_duration_seconds_bucket{endpoint="/token",le="+Inf"} 3`,
+		`token_server_http_request_duration_seconds_count{endpoint="/token"} 3`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q\ngot:\n%s", want, body)
+		}
+	}
+}
+
 // ── TestCacheThunderingHerd ─────────────────────────────────────────
 
 func TestCacheThunderingHerd(t *testing.T) {
