@@ -11,10 +11,14 @@ tokens — Ansible, CI plumbing, custom autoscalers. Note that
 folded this logic in as of its v0.2 and no longer calls this service;
 see "Relationship to gha-nomad-dispatcher" below.
 
-Lifted from a working internal deployment that's been running in
-production. Multi-tenancy is the recommended mode (per-org GitHub
-Apps for blast-radius isolation); legacy single-App-many-installs
-mode is kept for compatibility.
+Lifted from a working internal deployment. It ran as its own LXC in
+the nkg homelab until `gha-nomad-dispatcher` v0.2 folded the minting
+logic in; it is **no longer deployed there** (see below). The code is
+maintained and released regardless, for non-Nomad consumers.
+
+Multi-tenancy is the recommended mode (per-org GitHub Apps for
+blast-radius isolation); legacy single-App-many-installs mode is kept
+for compatibility.
 
 ## Endpoints
 
@@ -123,7 +127,9 @@ safe default, firewall or not.
 
 ### Migrating an existing deployment
 
-This is a breaking change for a server that's already running.
+Not applicable to the nkg homelab — nothing is deployed, so there are
+no callers to migrate. Kept for anyone who *is* running this: the
+fail-closed default is a breaking change for existing callers.
 
 1. Deploy with `TOKEN_SERVER_ALLOW_ANONYMOUS=true`. Nothing changes for
    existing callers.
@@ -229,12 +235,21 @@ GitHub App credentials. It's also the only one of the two that mints
 **removal** tokens, which `oci-actions-runner` needs for
 `RUNNER_REMOVE_TOKEN` when running non-ephemeral runners.
 
-Deployed on the private services tier (VLAN-isolated, in the
-[terraform-proxmox-fleet](https://github.com/nkg/terraform-proxmox-fleet)
-deployment). Callers now authenticate with a bearer token and are
-scoped to specific orgs, so the firewall is defence in depth rather
+**Not currently deployed anywhere.** The nkg homelab's CI platform
+decided against it — see platform ADR-019, which records the Nomad
+runner design and concludes: *"`nkg/gha-token-server` is now redundant
+… no action, but don't deploy it for this platform."* An earlier
+version of this README claimed it ran on the fleet's services tier;
+that was aspirational and never true.
+
+So there is no migration to do for the caller-authentication change
+below: there are no existing callers to issue credentials to. Anyone
+adopting this service starts with clients configured from the outset.
+
+If you do deploy it: callers authenticate with a bearer token and are
+scoped to specific orgs, so a firewall becomes defence in depth rather
 than the only control. There's still no mTLS — the credential is a
-shared secret in transit, so keep this on a private network or put TLS
+shared secret in transit, so keep it on a private network or put TLS
 in front of it.
 
 ## Verifying a release
