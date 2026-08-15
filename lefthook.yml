@@ -4,7 +4,7 @@ pre-commit:
   parallel: true
   commands:
     gofmt:
-      glob: "**/*.go"
+      glob: "{,**/}*.go"
       run: |
         unformatted=$(gofmt -l {staged_files})
         if [ -n "$unformatted" ]; then
@@ -14,7 +14,7 @@ pre-commit:
         fi
 
     go-vet:
-      glob: "**/*.go"
+      glob: "{,**/}*.go"
       run: go vet ./...
 
 pre-push:
