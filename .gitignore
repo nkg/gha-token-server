@@ -9,6 +9,12 @@ github-app-token-server
 # `go build ./...` names the binary after the module directory
 gha-token-server
 
+# Real client ACLs. Only clients.example.json belongs in the repo —
+# the live file names actual callers and is rendered at deploy time.
+clients.json
+clients.*.json
+!clients.example.json
+
 # Editor / IDE
 .vscode/
 .idea/

@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -76,6 +77,16 @@ type Config struct {
 	GitHubRepo    string             // optional repo-scope; applies under whichever tenant is in play
 	ListenAddr    string
 	githubBaseURL string
+
+	// Clients are the callers authorised to mint tokens. Empty only
+	// when AllowAnonymous is set — see loadConfig.
+	Clients []*Client
+
+	// AllowAnonymous disables caller authentication entirely. Opt-in
+	// via TOKEN_SERVER_ALLOW_ANONYMOUS=true, and loudly logged at
+	// startup, because it restores the old "anyone who can reach the
+	// port can mint for any org" behaviour.
+	AllowAnonymous bool
 }
 
 // tokenCache caches installation access tokens, keyed by lowercased org name.
@@ -180,6 +191,10 @@ type serverMetrics struct {
 	cacheHits       atomic.Int64
 	cacheMisses     atomic.Int64
 	githubAPIErrors map[string]int64 // operation -> count
+
+	// authFailures counts rejected requests by reason. Worth alerting
+	// on: a rising unknown_token count is someone probing the port.
+	authFailures map[string]int64
 }
 
 func newServerMetrics() *serverMetrics {
@@ -187,7 +202,14 @@ func newServerMetrics() *serverMetrics {
 		httpRequestsTotal: make(map[string]map[int]int64),
 		httpDuration:      make(map[string]*durationHistogram),
 		githubAPIErrors:   make(map[string]int64),
+		authFailures:      make(map[string]int64),
 	}
+}
+
+func (m *serverMetrics) recordAuthFailure(reason authFailure) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.authFailures[string(reason)]++
 }
 
 func (m *serverMetrics) recordRequest(endpoint string, statusCode int, duration time.Duration) {
@@ -238,7 +260,22 @@ func main() {
 		"addr", cfg.ListenAddr,
 		"tenants", len(cfg.Tenants),
 		"default_org", cfg.DefaultOrg,
+		"clients", len(cfg.Clients),
 	)
+
+	if cfg.AllowAnonymous {
+		slog.Warn("caller authentication is DISABLED " +
+			"(TOKEN_SERVER_ALLOW_ANONYMOUS=true) — any caller that can reach " +
+			"this port can mint runner registration tokens for any configured org")
+	} else {
+		for _, c := range cfg.Clients {
+			if c.wildcard {
+				slog.Info("client authorised", "client", c.Name, "orgs", "*")
+			} else {
+				slog.Info("client authorised", "client", c.Name, "orgs", sortedSetKeys(c.orgs))
+			}
+		}
+	}
 	for org, tenant := range cfg.Tenants {
 		if cfg.GitHubRepo != "" {
 			slog.Info("tenant registered",
@@ -318,12 +355,44 @@ func loadConfig() (*Config, error) {
 		listenAddr = ":8080"
 	}
 
+	clients, err := parseClients()
+	if err != nil {
+		return nil, err
+	}
+
+	allowAnonymous := strings.EqualFold(strings.TrimSpace(os.Getenv("TOKEN_SERVER_ALLOW_ANONYMOUS")), "true")
+
+	// Fail closed. Minting a runner registration token is equivalent
+	// to being able to attach a runner to the org, so starting with
+	// no idea who is allowed to ask is not a safe default — even
+	// behind a firewall. The escape hatch exists so the binary can be
+	// rolled out before every caller has a credential, but it has to
+	// be chosen deliberately.
+	if len(clients) == 0 && !allowAnonymous {
+		return nil, fmt.Errorf(
+			"no clients configured: set TOKEN_SERVER_CLIENTS_PATH (or TOKEN_SERVER_CLIENTS), " +
+				"or set TOKEN_SERVER_ALLOW_ANONYMOUS=true to run without caller authentication")
+	}
+
+	// An ACL naming an org this server doesn't serve is a typo, and a
+	// silent one — the client would just get 403s for a name that
+	// looks right. Catch it at startup instead.
+	for _, c := range clients {
+		for org := range c.orgs {
+			if _, ok := tenants[org]; !ok {
+				return nil, fmt.Errorf("client %q is authorised for org %q, which is not a configured tenant", c.Name, org)
+			}
+		}
+	}
+
 	return &Config{
-		Tenants:       tenants,
-		DefaultOrg:    defaultOrg,
-		GitHubRepo:    os.Getenv("GITHUB_REPO"),
-		ListenAddr:    listenAddr,
-		githubBaseURL: "https://api.github.com",
+		Tenants:        tenants,
+		DefaultOrg:     defaultOrg,
+		GitHubRepo:     os.Getenv("GITHUB_REPO"),
+		ListenAddr:     listenAddr,
+		githubBaseURL:  "https://api.github.com",
+		Clients:        clients,
+		AllowAnonymous: allowAnonymous,
 	}, nil
 }
 
@@ -758,12 +827,34 @@ func runnerTokenHandler(cfg *Config, kind string) http.HandlerFunc {
 			return
 		}
 
+		// Authenticate before doing anything else, so an unauthorised
+		// caller can't use the shape of the response to learn which
+		// orgs this server serves.
+		client, failure := authenticate(cfg, r)
+		if failure != "" {
+			slog.Warn("rejected unauthenticated request",
+				"endpoint", r.URL.Path, "reason", string(failure), "remote", remoteHost(r))
+			writeAuthFailure(w, failure)
+			return
+		}
+
 		org := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("org")))
 		if org == "" {
 			org = cfg.DefaultOrg
 		}
 		if org == "" {
 			http.Error(w, "org query parameter required (no default configured)", http.StatusBadRequest)
+			return
+		}
+
+		// The ACL check comes before the tenant lookup, and both
+		// failures look the same to the caller: a client that isn't
+		// authorised for an org learns nothing about whether that org
+		// exists here.
+		if !client.allowedFor(org) {
+			slog.Warn("client not authorised for org",
+				"client", client.Name, "org", org, "endpoint", r.URL.Path)
+			writeAuthFailure(w, authOrgDenied)
 			return
 		}
 
@@ -809,9 +900,28 @@ func runnerTokenHandler(cfg *Config, kind string) http.HandlerFunc {
 			}
 		}
 
+		// Audit trail. Until callers were identified there was nothing
+		// to record here — a mint was just an anonymous 200. The token
+		// itself is never logged.
+		slog.Info("minted runner token",
+			"client", client.Name, "org", org, "kind", kind, "remote", remoteHost(r))
+
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, token)
 	}
+}
+
+// remoteHost is the caller's address without the ephemeral port,
+// for logs. Best-effort: it reflects the immediate peer, which behind
+// a proxy is the proxy. No X-Forwarded-For parsing — trusting that
+// header without a vetted proxy in front lets a caller forge its own
+// apparent source.
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -893,6 +1003,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	for op, count := range metrics.githubAPIErrors {
 		apiErrors[op] = count
 	}
+
+	authFailures := make(map[string]int64, len(metrics.authFailures))
+	for reason, count := range metrics.authFailures {
+		authFailures[reason] = count
+	}
 	metrics.mu.Unlock()
 
 	cacheHits := metrics.cacheHits.Load()
@@ -944,12 +1059,30 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "token_server_github_api_errors_total{operation=%q} %d\n", op, apiErrors[op])
 	}
 
+	// token_server_auth_failures_total
+	b.WriteString("\n# HELP token_server_auth_failures_total Rejected requests by reason\n")
+	b.WriteString("# TYPE token_server_auth_failures_total counter\n")
+	for _, reason := range sortedKeys(authFailures) {
+		fmt.Fprintf(&b, "token_server_auth_failures_total{reason=%q} %d\n", reason, authFailures[reason])
+	}
+
 	w.Write([]byte(b.String()))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedSetKeys returns the members of a set in a stable order, so
+// startup logs don't reshuffle between restarts.
+func sortedSetKeys(m map[string]struct{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
