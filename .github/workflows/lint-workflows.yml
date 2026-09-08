@@ -12,4 +12,4 @@ on:
 
 jobs:
   lint:
-    uses: nkg/github-actions/.github/workflows/lint-workflows.yml@v2
+    uses: nkg/github-actions/.github/workflows/lint-workflows.yml@v3
