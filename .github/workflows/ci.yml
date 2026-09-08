@@ -18,7 +18,7 @@ jobs:
   # govulncheck, via the shared reusable. go + golangci-lint come from
   # mise.toml. Replaces the previous vet/test/lint jobs.
   go:
-    uses: nkg/github-actions/.github/workflows/go.yml@v2
+    uses: nkg/github-actions/.github/workflows/go.yml@v3
     with:
       use-mise: true
       run-golangci-lint: true
