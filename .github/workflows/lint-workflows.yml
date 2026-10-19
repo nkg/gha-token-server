@@ -13,3 +13,9 @@ on:
 jobs:
   lint:
     uses: nkg/github-actions/.github/workflows/lint-workflows.yml@v3
+    # Public repo: always GitHub-hosted (free here). The shared reusable
+    # defaults to the self-hosted pool, which would let fork PRs run code on
+    # our own hosts -- and with no runner registered here the job just
+    # queued for 24h and was cancelled.
+    with:
+      runs-on: '["ubuntu-latest"]'
